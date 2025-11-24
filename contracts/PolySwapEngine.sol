@@ -1,44 +1,12 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
-
-/**
- * @title PolySwap Engine
- * @dev A decentralized token swap engine with liquidity pools and automated market maker functionality
- */
-contract PolySwapEngine {
-    
-    // State variables
+State variables
     address public owner;
     uint256 public totalLiquidityPools;
-    uint256 public platformFeePercent = 3; // 0.3% fee (basis points)
-    
-    struct LiquidityPool {
-        address tokenA;
-        address tokenB;
-        uint256 reserveA;
-        uint256 reserveB;
-        uint256 totalLiquidity;
-        bool isActive;
-    }
-    
-    struct UserLiquidity {
-        uint256 liquidityTokens;
-        uint256 timestamp;
-    }
-    
-    // Mappings
+    uint256 public platformFeePercent = 3; Mappings
     mapping(uint256 => LiquidityPool) public liquidityPools;
     mapping(address => mapping(uint256 => UserLiquidity)) public userLiquidityPositions;
     mapping(address => uint256) public platformFees;
     
-    // Events
-    event PoolCreated(uint256 indexed poolId, address tokenA, address tokenB);
-    event LiquidityAdded(uint256 indexed poolId, address indexed provider, uint256 amountA, uint256 amountB);
-    event LiquidityRemoved(uint256 indexed poolId, address indexed provider, uint256 amountA, uint256 amountB);
-    event TokensSwapped(uint256 indexed poolId, address indexed user, address tokenIn, uint256 amountIn, uint256 amountOut);
-    event FeeCollected(address indexed token, uint256 amount);
-    
-    // Modifiers
+    Modifiers
     modifier onlyOwner() {
         require(msg.sender == owner, "Not authorized");
         _;
@@ -172,25 +140,13 @@ contract PolySwapEngine {
         uint256 reserveIn = isTokenA ? pool.reserveA : pool.reserveB;
         uint256 reserveOut = isTokenA ? pool.reserveB : pool.reserveA;
         
-        // Apply fee
-        uint256 amountInWithFee = amountIn * (1000 - platformFeePercent);
-        
-        // Constant product formula: amountOut = (amountIn * reserveOut) / (reserveIn + amountIn)
+        Constant product formula: amountOut = (amountIn * reserveOut) / (reserveIn + amountIn)
         amountOut = (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
         
         require(amountOut > 0, "Insufficient output amount");
         require(amountOut < reserveOut, "Insufficient liquidity");
         
-        // Update reserves
-        if (isTokenA) {
-            pool.reserveA += amountIn;
-            pool.reserveB -= amountOut;
-        } else {
-            pool.reserveB += amountIn;
-            pool.reserveA -= amountOut;
-        }
-        
-        // Collect fee
+        Collect fee
         uint256 fee = (amountIn * platformFeePercent) / 1000;
         platformFees[tokenIn] += fee;
         
@@ -280,36 +236,9 @@ contract PolySwapEngine {
      * @param newFeePercent New fee percentage in basis points
      */
     function updatePlatformFee(uint256 newFeePercent) external onlyOwner {
-        require(newFeePercent <= 50, "Fee too high"); // Max 5%
-        platformFeePercent = newFeePercent;
-    }
-    
-    /**
-     * @dev Helper function: Calculate square root (Babylonian method)
-     */
-    function sqrt(uint256 x) internal pure returns (uint256 y) {
-        uint256 z = (x + 1) / 2;
-        y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-    }
-    
-    /**
-     * @dev Deactivate a pool (only owner)
-     */
-    function deactivatePool(uint256 poolId) external onlyOwner {
-        require(poolId < totalLiquidityPools, "Pool does not exist");
-        liquidityPools[poolId].isActive = false;
-    }
-    
-    /**
-     * @dev Withdraw collected fees (only owner)
-     */
-    function withdrawFees(address token, uint256 amount) external onlyOwner {
-        require(platformFees[token] >= amount, "Insufficient fees");
-        platformFees[token] -= amount;
-        // Transfer logic would go here with actual ERC20 implementation
+        require(newFeePercent <= 50, "Fee too high"); Transfer logic would go here with actual ERC20 implementation
     }
 }
+// 
+End
+// 
