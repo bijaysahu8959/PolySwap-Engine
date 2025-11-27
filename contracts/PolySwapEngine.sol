@@ -1,244 +1,283 @@
-State variables
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.21;
+
+/**
+ * @title PolySwap Engine
+ * @notice Modular multi-pool AMM engine supporting multiple curve types:
+ *         - Constant Product (x * y = k)
+ *         - Stable-Swap (Curve-style)
+ *         - Weighted Pools (Balancer-style)
+ * @dev This is a core template; add reentrancy guards, TWAP oracles, admin logic, etc.
+ */
+
+interface IERC20 {
+    function balanceOf(address owner) external view returns (uint256);
+    function transfer(address to, uint256 val) external returns (bool);
+    function transferFrom(address from, address to, uint256 val) external returns (bool);
+    function approve(address spender, uint256 val) external returns (bool);
+}
+
+contract PolySwapEngine {
+    // --------------------------------------------------------
+    // ENUMS & STRUCTS
+    // --------------------------------------------------------
+    enum PoolType {
+        CONSTANT_PRODUCT, // xy = k
+        STABLE_SWAP,      // Curve-style
+        WEIGHTED          // Balancer-style
+    }
+
+    struct Pool {
+        address tokenA;
+        address tokenB;
+        uint256 reserveA;
+        uint256 reserveB;
+        uint32 weightA;  // Only for Weighted Pools (1–100)
+        uint32 weightB;  // Only for Weighted Pools
+        uint256 amp;     // Only for Stable-Swap
+        PoolType poolType;
+        bool exists;
+    }
+
+    uint256 public poolCount;
+    mapping(uint256 => Pool) public pools;
+
+    uint256 public constant FEE_BPS = 25; // 0.25%
+    uint256 public constant BPS = 10_000;
+
     address public owner;
-    uint256 public totalLiquidityPools;
-    uint256 public platformFeePercent = 3; Mappings
-    mapping(uint256 => LiquidityPool) public liquidityPools;
-    mapping(address => mapping(uint256 => UserLiquidity)) public userLiquidityPositions;
-    mapping(address => uint256) public platformFees;
-    
-    Modifiers
+
+    // --------------------------------------------------------
+    // EVENTS
+    // --------------------------------------------------------
+    event PoolCreated(
+        uint256 indexed poolId,
+        address indexed tokenA,
+        address indexed tokenB,
+        PoolType poolType
+    );
+
+    event LiquidityAdded(
+        uint256 indexed poolId,
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB
+    );
+
+    event LiquidityRemoved(
+        uint256 indexed poolId,
+        address indexed provider,
+        uint256 amountA,
+        uint256 amountB
+    );
+
+    event SwapExecuted(
+        uint256 indexed poolId,
+        address indexed user,
+        address tokenIn,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+
+    // --------------------------------------------------------
+    // MODIFIERS
+    // --------------------------------------------------------
     modifier onlyOwner() {
-        require(msg.sender == owner, "Not authorized");
+        require(msg.sender == owner, "Not owner");
         _;
     }
-    
-    modifier poolExists(uint256 poolId) {
-        require(poolId < totalLiquidityPools, "Pool does not exist");
-        require(liquidityPools[poolId].isActive, "Pool is not active");
-        _;
-    }
-    
+
+    // --------------------------------------------------------
+    // CONSTRUCTOR
+    // --------------------------------------------------------
     constructor() {
         owner = msg.sender;
     }
-    
-    /**
-     * @dev Core Function 1: Create a new liquidity pool
-     * @param tokenA Address of first token
-     * @param tokenB Address of second token
-     * @return poolId The ID of the newly created pool
-     */
-    function createPool(address tokenA, address tokenB) external returns (uint256 poolId) {
-        require(tokenA != address(0) && tokenB != address(0), "Invalid token addresses");
-        require(tokenA != tokenB, "Tokens must be different");
-        
-        poolId = totalLiquidityPools;
-        
-        liquidityPools[poolId] = LiquidityPool({
+
+    // --------------------------------------------------------
+    // POOL CREATION
+    // --------------------------------------------------------
+    function createPool(
+        address tokenA,
+        address tokenB,
+        PoolType poolType,
+        uint32 weightA,
+        uint32 weightB,
+        uint256 amp
+    ) external onlyOwner returns (uint256) {
+        require(tokenA != tokenB, "Same token");
+
+        poolCount++;
+
+        pools[poolCount] = Pool({
             tokenA: tokenA,
             tokenB: tokenB,
             reserveA: 0,
             reserveB: 0,
-            totalLiquidity: 0,
-            isActive: true
+            weightA: weightA,
+            weightB: weightB,
+            amp: amp,
+            poolType: poolType,
+            exists: true
         });
-        
-        totalLiquidityPools++;
-        
-        emit PoolCreated(poolId, tokenA, tokenB);
-        return poolId;
+
+        emit PoolCreated(poolCount, tokenA, tokenB, poolType);
+        return poolCount;
     }
-    
-    /**
-     * @dev Core Function 2: Add liquidity to a pool
-     * @param poolId The pool identifier
-     * @param amountA Amount of tokenA to add
-     * @param amountB Amount of tokenB to add
-     */
-    function addLiquidity(uint256 poolId, uint256 amountA, uint256 amountB) 
-        external 
-        poolExists(poolId) 
-    {
-        require(amountA > 0 && amountB > 0, "Amounts must be greater than 0");
-        
-        LiquidityPool storage pool = liquidityPools[poolId];
-        
-        uint256 liquidityMinted;
-        
-        if (pool.totalLiquidity == 0) {
-            liquidityMinted = sqrt(amountA * amountB);
-        } else {
-            uint256 liquidityA = (amountA * pool.totalLiquidity) / pool.reserveA;
-            uint256 liquidityB = (amountB * pool.totalLiquidity) / pool.reserveB;
-            liquidityMinted = liquidityA < liquidityB ? liquidityA : liquidityB;
-        }
-        
-        require(liquidityMinted > 0, "Insufficient liquidity minted");
-        
-        pool.reserveA += amountA;
-        pool.reserveB += amountB;
-        pool.totalLiquidity += liquidityMinted;
-        
-        userLiquidityPositions[msg.sender][poolId].liquidityTokens += liquidityMinted;
-        userLiquidityPositions[msg.sender][poolId].timestamp = block.timestamp;
-        
+
+    // --------------------------------------------------------
+    // LIQUIDITY MANAGEMENT
+    // --------------------------------------------------------
+    function addLiquidity(
+        uint256 poolId,
+        uint256 amountA,
+        uint256 amountB
+    ) external {
+        Pool storage p = pools[poolId];
+        require(p.exists, "Pool not found");
+
+        IERC20(p.tokenA).transferFrom(msg.sender, address(this), amountA);
+        IERC20(p.tokenB).transferFrom(msg.sender, address(this), amountB);
+
+        p.reserveA += amountA;
+        p.reserveB += amountB;
+
         emit LiquidityAdded(poolId, msg.sender, amountA, amountB);
     }
-    
-    /**
-     * @dev Core Function 3: Remove liquidity from a pool
-     * @param poolId The pool identifier
-     * @param liquidityAmount Amount of liquidity tokens to burn
-     */
-    function removeLiquidity(uint256 poolId, uint256 liquidityAmount) 
-        external 
-        poolExists(poolId) 
-        returns (uint256 amountA, uint256 amountB)
-    {
-        require(liquidityAmount > 0, "Amount must be greater than 0");
-        require(
-            userLiquidityPositions[msg.sender][poolId].liquidityTokens >= liquidityAmount,
-            "Insufficient liquidity tokens"
-        );
-        
-        LiquidityPool storage pool = liquidityPools[poolId];
-        
-        amountA = (liquidityAmount * pool.reserveA) / pool.totalLiquidity;
-        amountB = (liquidityAmount * pool.reserveB) / pool.totalLiquidity;
-        
-        require(amountA > 0 && amountB > 0, "Insufficient liquidity burned");
-        
-        pool.reserveA -= amountA;
-        pool.reserveB -= amountB;
-        pool.totalLiquidity -= liquidityAmount;
-        
-        userLiquidityPositions[msg.sender][poolId].liquidityTokens -= liquidityAmount;
-        
-        emit LiquidityRemoved(poolId, msg.sender, amountA, amountB);
-        
-        return (amountA, amountB);
+
+    function removeLiquidity(
+        uint256 poolId,
+        uint256 sharePercentBps
+    ) external onlyOwner returns (uint256 outA, uint256 outB) {
+        Pool storage p = pools[poolId];
+        require(p.exists, "Pool not found");
+        require(sharePercentBps <= BPS, "Invalid share");
+
+        outA = (p.reserveA * sharePercentBps) / BPS;
+        outB = (p.reserveB * sharePercentBps) / BPS;
+
+        p.reserveA -= outA;
+        p.reserveB -= outB;
+
+        IERC20(p.tokenA).transfer(msg.sender, outA);
+        IERC20(p.tokenB).transfer(msg.sender, outB);
+
+        emit LiquidityRemoved(poolId, msg.sender, outA, outB);
     }
-    
-    /**
-     * @dev Core Function 4: Swap tokens using constant product formula (x * y = k)
-     * @param poolId The pool identifier
-     * @param tokenIn Address of input token
-     * @param amountIn Amount of input tokens
-     * @return amountOut Amount of output tokens
-     */
-    function swapTokens(uint256 poolId, address tokenIn, uint256 amountIn) 
-        external 
-        poolExists(poolId) 
-        returns (uint256 amountOut)
-    {
-        require(amountIn > 0, "Amount must be greater than 0");
-        
-        LiquidityPool storage pool = liquidityPools[poolId];
-        require(tokenIn == pool.tokenA || tokenIn == pool.tokenB, "Invalid token");
-        
-        bool isTokenA = tokenIn == pool.tokenA;
-        uint256 reserveIn = isTokenA ? pool.reserveA : pool.reserveB;
-        uint256 reserveOut = isTokenA ? pool.reserveB : pool.reserveA;
-        
-        Constant product formula: amountOut = (amountIn * reserveOut) / (reserveIn + amountIn)
-        amountOut = (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
-        
-        require(amountOut > 0, "Insufficient output amount");
-        require(amountOut < reserveOut, "Insufficient liquidity");
-        
-        Collect fee
-        uint256 fee = (amountIn * platformFeePercent) / 1000;
-        platformFees[tokenIn] += fee;
-        
-        emit TokensSwapped(poolId, msg.sender, tokenIn, amountIn, amountOut);
-        emit FeeCollected(tokenIn, fee);
-        
-        return amountOut;
+
+    // --------------------------------------------------------
+    // SWAP LOGIC
+    // --------------------------------------------------------
+    function swap(
+        uint256 poolId,
+        address tokenIn,
+        uint256 amountIn
+    ) external returns (uint256 amountOut) {
+        Pool storage p = pools[poolId];
+        require(p.exists, "Pool not found");
+        require(tokenIn == p.tokenA || tokenIn == p.tokenB, "Wrong token");
+
+        bool isAin = tokenIn == p.tokenA;
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+
+        uint256 amountInAfterFee = amountIn - (amountIn * FEE_BPS / BPS);
+
+        if (p.poolType == PoolType.CONSTANT_PRODUCT) {
+            amountOut = _swapConstantProduct(p, isAin, amountInAfterFee);
+        } else if (p.poolType == PoolType.STABLE_SWAP) {
+            amountOut = _swapStable(p, isAin, amountInAfterFee);
+        } else {
+            amountOut = _swapWeighted(p, isAin, amountInAfterFee);
+        }
+
+        address tokenOut = isAin ? p.tokenB : p.tokenA;
+        IERC20(tokenOut).transfer(msg.sender, amountOut);
+
+        emit SwapExecuted(poolId, msg.sender, tokenIn, amountIn, amountOut);
     }
-    
-    /**
-     * @dev Core Function 5: Get swap quote without executing
-     * @param poolId The pool identifier
-     * @param tokenIn Address of input token
-     * @param amountIn Amount of input tokens
-     * @return amountOut Estimated output amount
-     */
-    function getSwapQuote(uint256 poolId, address tokenIn, uint256 amountIn) 
-        external 
-        view 
-        poolExists(poolId) 
-        returns (uint256 amountOut)
+
+    // --------------------------------------------------------
+    // CONSTANT PRODUCT AMM (xy = k)
+    // --------------------------------------------------------
+    function _swapConstantProduct(Pool storage p, bool isAin, uint256 dx)
+        internal
+        returns (uint256)
     {
-        LiquidityPool memory pool = liquidityPools[poolId];
-        require(tokenIn == pool.tokenA || tokenIn == pool.tokenB, "Invalid token");
-        
-        bool isTokenA = tokenIn == pool.tokenA;
-        uint256 reserveIn = isTokenA ? pool.reserveA : pool.reserveB;
-        uint256 reserveOut = isTokenA ? pool.reserveB : pool.reserveA;
-        
-        uint256 amountInWithFee = amountIn * (1000 - platformFeePercent);
-        amountOut = (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
-        
-        return amountOut;
+        uint256 x = p.reserveA;
+        uint256 y = p.reserveB;
+
+        if (isAin) {
+            uint256 dy = (y * dx) / (x + dx);
+            p.reserveA += dx;
+            p.reserveB -= dy;
+            return dy;
+        } else {
+            uint256 dy = (x * dx) / (y + dx);
+            p.reserveB += dx;
+            p.reserveA -= dy;
+            return dy;
+        }
     }
-    
-    /**
-     * @dev Core Function 6: Get pool information
-     * @param poolId The pool identifier
-     * @return tokenA Address of first token in pool
-     * @return tokenB Address of second token in pool
-     * @return reserveA Reserve amount of tokenA
-     * @return reserveB Reserve amount of tokenB
-     * @return totalLiquidity Total liquidity tokens minted
-     * @return isActive Whether the pool is active
-     */
-    function getPoolInfo(uint256 poolId) 
-        external 
-        view 
-        returns (
-            address tokenA,
-            address tokenB,
-            uint256 reserveA,
-            uint256 reserveB,
-            uint256 totalLiquidity,
-            bool isActive
-        )
+
+    // --------------------------------------------------------
+    // STABLE-SWAP (Simplified Curve formula)
+    // --------------------------------------------------------
+    function _swapStable(Pool storage p, bool isAin, uint256 dx)
+        internal
+        returns (uint256)
     {
-        LiquidityPool memory pool = liquidityPools[poolId];
-        return (
-            pool.tokenA,
-            pool.tokenB,
-            pool.reserveA,
-            pool.reserveB,
-            pool.totalLiquidity,
-            pool.isActive
-        );
+        // simplified stable curve: dy = dx (1:1)
+        uint256 dy = dx;
+
+        if (isAin) {
+            require(p.reserveB >= dy, "Insufficient B");
+            p.reserveA += dx;
+            p.reserveB -= dy;
+        } else {
+            require(p.reserveA >= dy, "Insufficient A");
+            p.reserveB += dx;
+            p.reserveA -= dy;
+        }
+
+        return dy;
     }
-    
-    /**
-     * @dev Core Function 7: Get user's liquidity position
-     * @param user Address of the user
-     * @param poolId The pool identifier
-     * @return liquidityTokens Amount of liquidity tokens
-     * @return timestamp When liquidity was added
-     */
-    function getUserPosition(address user, uint256 poolId) 
-        external 
-        view 
-        returns (uint256 liquidityTokens, uint256 timestamp)
+
+    // --------------------------------------------------------
+    // WEIGHTED POOLS (Balancer-style)
+    // --------------------------------------------------------
+    function _swapWeighted(Pool storage p, bool isAin, uint256 dx)
+        internal
+        returns (uint256)
     {
-        UserLiquidity memory position = userLiquidityPositions[user][poolId];
-        return (position.liquidityTokens, position.timestamp);
+        uint256 weightIn = isAin ? p.weightA : p.weightB;
+        uint256 weightOut = isAin ? p.weightB : p.weightA;
+
+        uint256 balanceIn = isAin ? p.reserveA : p.reserveB;
+        uint256 balanceOut = isAin ? p.reserveB : p.reserveA;
+
+        uint256 newBalanceIn = balanceIn + dx;
+        uint256 ratio = balanceIn * 1e18 / newBalanceIn;
+
+        uint256 power = (ratio ** (weightIn * 1e18 / weightOut)) / 1e18;
+        uint256 newBalanceOut = balanceOut * power / 1e18;
+
+        uint256 dy = balanceOut - newBalanceOut;
+
+        if (isAin) {
+            p.reserveA += dx;
+            p.reserveB -= dy;
+        } else {
+            p.reserveB += dx;
+            p.reserveA -= dy;
+        }
+
+        return dy;
     }
-    
-    /**
-     * @dev Core Function 8: Update platform fee (only owner)
-     * @param newFeePercent New fee percentage in basis points
-     */
-    function updatePlatformFee(uint256 newFeePercent) external onlyOwner {
-        require(newFeePercent <= 50, "Fee too high"); Transfer logic would go here with actual ERC20 implementation
+
+    // --------------------------------------------------------
+    // ADMIN
+    // --------------------------------------------------------
+    function transferOwnership(address newOwner) external onlyOwner {
+        owner = newOwner;
     }
 }
-// 
-End
-// 
